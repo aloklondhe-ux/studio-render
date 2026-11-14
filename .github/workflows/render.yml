@@ -1,0 +1,197 @@
+# Render a studio-engine project in parallel on free GitHub runners (this repo is public; the engine is private).
+#
+#   plan    reads the project's length and splits it into N frame-exact chunks
+#   render  one runner per chunk: node render.mjs --from/--to (headless Chromium, SwiftShader) -> chunk.mp4, encrypted
+#   join    joins the chunks losslessly, mixes the soundtrack (audio/mix.py) and reports timings and loudness
+#
+# The engine is checked out with a read-only deploy key (secret STUDIO_ENGINE_KEY). Chunks and the final video are
+# encrypted with a passphrase derived from that secret before upload, so artifacts in this public repo can't be watched.
+# Decrypt locally with the helper in the private engine repo.
+# Triggered only by hand (workflow_dispatch) or by other workflows here; never by pull requests.
+name: Render
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Project folder under projects/ in the private engine
+        required: true
+      chunks:
+        description: Parallel machines (1-20)
+        default: '10'
+      from:
+        description: Start second (blank = start)
+        default: ''
+      to:
+        description: End second (blank = end)
+        default: ''
+      scale:
+        description: Resolution scale (1 = full, 0.5 = quick test)
+        default: '1'
+      workers:
+        description: Browser workers per machine (4-core runners)
+        default: '3'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04 # Playwright 1.56 has no deps for ubuntu-latest (26.04) yet
+    outputs:
+      chunks: ${{ steps.plan.outputs.chunks }}
+      full: ${{ steps.plan.outputs.full }}
+    steps:
+      - name: Hide the project name in logs
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: echo "::add-mask::$PROJECT"
+      - uses: actions/checkout@v5
+        with:
+          repository: aloklondhe-ux/studio-engine
+          ssh-key: ${{ secrets.STUDIO_ENGINE_KEY }}
+          sparse-checkout: projects/${{ inputs.project }}
+      - id: plan
+        env:
+          P: projects/${{ inputs.project }}
+          N: ${{ inputs.chunks }}
+          FROM: ${{ inputs.from }}
+          TO: ${{ inputs.to }}
+        run: |
+          python3 - <<'EOF'
+          import json, math, os
+          p = os.environ["P"]
+          cfg = json.load(open(f"{p}/config.json", encoding="utf-8"))
+          fps = cfg.get("fps", 24)
+          shots = json.load(open(f"{p}/story/shots.json", encoding="utf-8"))
+          end_s = max([s["end"] for s in shots.get("shots", [])] + [cfg.get("duration", 0)])
+          total = math.ceil(end_s * fps)
+          f0 = round(float(os.environ["FROM"]) * fps) if os.environ["FROM"] else 0
+          f1 = min(total, round(float(os.environ["TO"]) * fps)) if os.environ["TO"] else total
+          n = max(1, min(20, int(os.environ["N"]), math.ceil((f1 - f0) / (fps * 5))))
+          cuts = [f0 + round(i * (f1 - f0) / n) for i in range(n + 1)]
+          chunks = [{"i": i, "from": f"{cuts[i] / fps:.6f}", "to": ("" if (i == n - 1 and f1 == total) else f"{cuts[i + 1] / fps:.6f}"),
+                     "frames": cuts[i + 1] - cuts[i]} for i in range(n)]
+          full = "true" if (f0 == 0 and f1 == total) else "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as o:
+              o.write(f"chunks={json.dumps(chunks)}\nfull={full}\n")
+          print(f"{total} frames at {fps} fps; rendering {f1 - f0} frames in {n} chunks; full={full}")
+          EOF
+
+  render:
+    needs: plan
+    runs-on: ubuntu-24.04 # Playwright 1.56 has no deps for ubuntu-latest (26.04) yet
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
+    steps:
+      - name: Hide the project name in logs
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: echo "::add-mask::$PROJECT"
+      - uses: actions/checkout@v5
+        with:
+          repository: aloklondhe-ux/studio-engine
+          ssh-key: ${{ secrets.STUDIO_ENGINE_KEY }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Browser and ffmpeg
+        run: |
+          npx playwright install --with-deps chromium >/dev/null
+          command -v ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null)
+          echo "cpus: $(nproc)"; ffmpeg -version | head -1
+      - name: Render chunk ${{ matrix.chunk.i }}
+        env:
+          P: projects/${{ inputs.project }}
+          FROM: ${{ matrix.chunk.from }}
+          TO: ${{ matrix.chunk.to }}
+          SCALE: ${{ inputs.scale }}
+          WORKERS: ${{ inputs.workers }}
+        run: |
+          args=(--project "$P" --from "$FROM" --out "$RUNNER_TEMP/chunk.mp4" --workers "$WORKERS")
+          [ -n "$TO" ] && args+=(--to "$TO")
+          [ "$SCALE" != "1" ] && args+=(--scale "$SCALE")
+          start=$(date +%s)
+          node render.mjs "${args[@]}" 2>&1 | grep -vE "^\s+[0-9]+/[0-9]+ frames" || true
+          test -s "$RUNNER_TEMP/chunk.mp4"
+          secs=$(( $(date +%s) - start ))
+          echo "Chunk ${{ matrix.chunk.i }}: ${{ matrix.chunk.frames }} frames in ${secs}s" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Encrypt
+        env:
+          KEY: ${{ secrets.STUDIO_ENGINE_KEY }}
+        run: |
+          PASS=$(printf '%s' "$KEY" | tr -d '\r\n ' | sha256sum | cut -d' ' -f1); echo "::add-mask::$PASS"; export PASS
+          openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:PASS -in "$RUNNER_TEMP/chunk.mp4" -out "chunk-$(printf %02d ${{ matrix.chunk.i }}).enc"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.chunk.i }}
+          path: chunk-*.enc
+          retention-days: 1
+
+  join:
+    needs: [plan, render]
+    runs-on: ubuntu-24.04 # Playwright 1.56 has no deps for ubuntu-latest (26.04) yet
+    steps:
+      - name: Hide the project name in logs
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: echo "::add-mask::$PROJECT"
+      - uses: actions/checkout@v5
+        with:
+          repository: aloklondhe-ux/studio-engine
+          ssh-key: ${{ secrets.STUDIO_ENGINE_KEY }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-*
+          merge-multiple: true
+          path: chunks
+      - name: Tools
+        run: |
+          command -v ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null)
+          pip install -q numpy scipy
+      - name: Decrypt and join
+        env:
+          KEY: ${{ secrets.STUDIO_ENGINE_KEY }}
+          P: projects/${{ inputs.project }}
+        run: |
+          PASS=$(printf '%s' "$KEY" | tr -d '\r\n ' | sha256sum | cut -d' ' -f1); echo "::add-mask::$PASS"; export PASS
+          mkdir -p "$P/build" "$P/out"
+          : > list.txt
+          for f in $(ls chunks/chunk-*.enc | sort); do
+            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:PASS -in "$f" -out "${f%.enc}.mp4"
+            echo "file '$PWD/${f%.enc}.mp4'" >> list.txt
+          done
+          ffmpeg -y -v error -f concat -safe 0 -i list.txt -c copy -movflags +faststart "$P/build/video_silent.mp4"
+          d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$P/build/video_silent.mp4")
+          echo "Joined $(wc -l < list.txt) chunks: ${d}s of video" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Mix soundtrack
+        if: needs.plan.outputs.full == 'true'
+        env:
+          P: projects/${{ inputs.project }}
+        run: |
+          python3 audio/mix.py --project "$P" --video "$P/build/video_silent.mp4"
+          f=$(ls "$P"/out/*.mp4 | head -1)
+          ffmpeg -hide_banner -i "$f" -vn -af ebur128=framelog=quiet -f null - 2>&1 | grep -E "I:|LRA:|Peak:" | tail -3 | sed 's/^/    /' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Encrypt final
+        env:
+          KEY: ${{ secrets.STUDIO_ENGINE_KEY }}
+          P: projects/${{ inputs.project }}
+        run: |
+          PASS=$(printf '%s' "$KEY" | tr -d '\r\n ' | sha256sum | cut -d' ' -f1); echo "::add-mask::$PASS"; export PASS
+          f=$(ls "$P"/out/*.mp4 2>/dev/null | head -1); f=${f:-$P/build/video_silent.mp4}
+          openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:PASS -in "$f" -out final.enc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final
+          path: final.enc
+          retention-days: 3
