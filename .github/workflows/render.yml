@@ -47,9 +47,7 @@ jobs:
       full: ${{ steps.plan.outputs.full }}
     steps:
       - name: Hide the project name in logs
-        env:
-          PROJECT: ${{ inputs.project }}
-        run: echo "::add-mask::$PROJECT"
+        run: echo "::add-mask::$(jq -r '.inputs.project // empty' "$GITHUB_EVENT_PATH")"
       - uses: actions/checkout@v5
         with:
           repository: aloklondhe-ux/studio-engine
@@ -93,9 +91,7 @@ jobs:
         chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
     steps:
       - name: Hide the project name in logs
-        env:
-          PROJECT: ${{ inputs.project }}
-        run: echo "::add-mask::$PROJECT"
+        run: echo "::add-mask::$(jq -r '.inputs.project // empty' "$GITHUB_EVENT_PATH")"
       - uses: actions/checkout@v5
         with:
           repository: aloklondhe-ux/studio-engine
@@ -143,9 +139,7 @@ jobs:
     runs-on: ubuntu-24.04 # Playwright 1.56 has no deps for ubuntu-latest (26.04) yet
     steps:
       - name: Hide the project name in logs
-        env:
-          PROJECT: ${{ inputs.project }}
-        run: echo "::add-mask::$PROJECT"
+        run: echo "::add-mask::$(jq -r '.inputs.project // empty' "$GITHUB_EVENT_PATH")"
       - uses: actions/checkout@v5
         with:
           repository: aloklondhe-ux/studio-engine
